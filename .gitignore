@@ -1,0 +1,44 @@
+# Claude Code (правила та локальні налаштування)
+.claude/
+CLAUDE.md
+
+# Бінарники та артефакти збірки
+/bin/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Покриття тестами та профілювання
+*.coverprofile
+coverage.*
+*.prof
+
+# Go workspace
+go.work
+go.work.sum
+
+# Змінні оточення та секрети
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Локальні дані
+*.db
+*.sqlite
+*.sqlite3
+/tmp/
+*.log
+
+# IDE та ОС
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
