@@ -3,15 +3,18 @@ package httpserver
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/labstack/echo/v5"
 )
 
-// New returns an Echo instance with the service routes registered.
-func New() *echo.Echo {
+// New returns an Echo instance with the service routes registered. Echo's own
+// messages (startup, shutdown, handler errors) go through log.
+func New(log *slog.Logger) *echo.Echo {
 	e := echo.New()
+	e.Logger = log
 	e.GET("/health", health)
 	return e
 }

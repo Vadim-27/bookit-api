@@ -2,6 +2,7 @@ package httpserver_test
 
 import (
 	"context"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,9 @@ import (
 
 	"github.com/Vadim-27/bookit-api/internal/platform/httpserver"
 )
+
+// discardLogger keeps test output quiet.
+func discardLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }
 
 // freeAddr returns a localhost address that was free a moment ago.
 func freeAddr(t *testing.T) string {
@@ -32,7 +36,7 @@ func TestRun_GracefulShutdown(t *testing.T) {
 
 	addr := freeAddr(t)
 	done := make(chan error, 1)
-	go func() { done <- httpserver.Run(ctx, addr, httpserver.New()) }()
+	go func() { done <- httpserver.Run(ctx, addr, httpserver.New(discardLogger())) }()
 
 	// Wait until the server answers.
 	deadline := time.Now().Add(3 * time.Second)
@@ -81,7 +85,7 @@ func TestHealth(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			e := httpserver.New()
+			e := httpserver.New(discardLogger())
 			req := httptest.NewRequest(tt.method, tt.path, nil)
 			rec := httptest.NewRecorder()
 			e.ServeHTTP(rec, req)

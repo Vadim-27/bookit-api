@@ -9,11 +9,11 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/Vadim-27/bookit-api/internal/platform/config"
 	"github.com/Vadim-27/bookit-api/internal/platform/httpserver"
+	"github.com/Vadim-27/bookit-api/internal/platform/logger"
+	"github.com/Vadim-27/bookit-api/internal/platform/postgres"
 )
-
-// defaultAddr is temporary: configuration from the environment comes in the next step.
-const defaultAddr = ":8080"
 
 func main() {
 	if err := run(); err != nil {
@@ -23,11 +23,26 @@ func main() {
 }
 
 func run() error {
+	cfg, err := config.Load(os.Getenv)
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+	log := logger.New(os.Stderr, cfg.Env == config.EnvProd, cfg.LogLevel)
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := httpserver.Run(ctx, defaultAddr, httpserver.New()); err != nil {
+	pool, err := postgres.NewPool(ctx, cfg.DatabaseURL, cfg.DBMaxConns)
+	if err != nil {
+		return fmt.Errorf("connect to postgres: %w", err)
+	}
+	// Deferred after the HTTP server stops: in-flight requests finish first.
+	defer pool.Close()
+
+	log.InfoContext(ctx, "starting bookit", "config", cfg)
+	if err := httpserver.Run(ctx, cfg.HTTPAddr, httpserver.New(log)); err != nil {
 		return fmt.Errorf("run http server: %w", err)
 	}
+	log.InfoContext(ctx, "bookit stopped")
 	return nil
 }

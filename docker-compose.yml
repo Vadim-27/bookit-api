@@ -1,0 +1,36 @@
+# Local development infrastructure. Variables come from .env (see .env.example).
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${BOOKIT_DB_USER:?set BOOKIT_DB_USER in .env}
+      POSTGRES_PASSWORD: ${BOOKIT_DB_PASSWORD:?set BOOKIT_DB_PASSWORD in .env}
+      POSTGRES_DB: ${BOOKIT_DB_NAME:?set BOOKIT_DB_NAME in .env}
+    ports:
+      # Bound to localhost only: the dev database must not be reachable from the network.
+      - "127.0.0.1:${BOOKIT_DB_PORT:-5440}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-off tool, not started by `docker compose up`.
+  # Usage: docker compose run --rm migrate up | down 1 | version
+  migrate:
+    image: migrate/migrate:v4.20.1
+    profiles: ["tools"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./migrations:/migrations:ro
+    entrypoint:
+      - migrate
+      - -path=/migrations
+      - -database=postgres://${BOOKIT_DB_USER}:${BOOKIT_DB_PASSWORD}@postgres:5432/${BOOKIT_DB_NAME}?sslmode=disable
+
+volumes:
+  pgdata:
