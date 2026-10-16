@@ -11,8 +11,10 @@ import (
 )
 
 const (
-	testPassword = "s3cretpw"
-	testDBURL    = "postgres://u:" + testPassword + "@localhost:5433/db?sslmode=disable"
+	testPassword  = "s3cretpw"
+	testDBURL     = "postgres://u:" + testPassword + "@localhost:5433/db?sslmode=disable"
+	testJWTSecret = "0123456789abcdef0123456789abcdef" // 32 bytes
+	testJWTOld    = "fedcba9876543210fedcba9876543210"
 )
 
 func TestLoad(t *testing.T) {
@@ -30,21 +32,30 @@ func TestLoad(t *testing.T) {
 			env:  nil,
 			want: config.Config{
 				Env: config.EnvDev, HTTPAddr: ":8080", LogLevel: slog.LevelInfo,
-				DatabaseURL: testDBURL, DBMaxConns: 10,
+				DatabaseURL: testDBURL, DBMaxConns: 10, JWTSecret: testJWTSecret,
 			},
 		},
 		{
 			name: "custom values",
 			env: map[string]string{
-				"BOOKIT_ENV":          "prod",
-				"BOOKIT_HTTP_ADDR":    "127.0.0.1:9000",
-				"BOOKIT_LOG_LEVEL":    "debug",
-				"BOOKIT_DB_MAX_CONNS": "25",
+				"BOOKIT_ENV":                 "prod",
+				"BOOKIT_HTTP_ADDR":           "127.0.0.1:9000",
+				"BOOKIT_LOG_LEVEL":           "debug",
+				"BOOKIT_DB_MAX_CONNS":        "25",
+				"BOOKIT_JWT_SECRET_PREVIOUS": testJWTOld,
+				"BOOKIT_REQUIRE_HTTPS":       "true",
 			},
 			want: config.Config{
 				Env: config.EnvProd, HTTPAddr: "127.0.0.1:9000", LogLevel: slog.LevelDebug,
 				DatabaseURL: testDBURL, DBMaxConns: 25,
+				JWTSecret: testJWTSecret, JWTPreviousSecret: testJWTOld,
+				RequireHTTPS: true,
 			},
+		},
+		{
+			name:    "require https is not a boolean",
+			env:     map[string]string{"BOOKIT_REQUIRE_HTTPS": "sometimes"},
+			wantErr: []string{"BOOKIT_REQUIRE_HTTPS"},
 		},
 		{
 			name:    "unknown env",
@@ -89,6 +100,23 @@ func TestLoad(t *testing.T) {
 			wantErr: []string{"BOOKIT_DB_MAX_CONNS"},
 		},
 		{
+			name:    "missing jwt secret",
+			env:     map[string]string{"BOOKIT_JWT_SECRET": ""},
+			wantErr: []string{"BOOKIT_JWT_SECRET"},
+		},
+		{
+			name:         "short jwt secret is rejected without being echoed",
+			env:          map[string]string{"BOOKIT_JWT_SECRET": "too-short-secret"},
+			wantErr:      []string{"BOOKIT_JWT_SECRET", "32"},
+			wantNotInErr: []string{"too-short-secret"},
+		},
+		{
+			name:         "short previous jwt secret is rejected without being echoed",
+			env:          map[string]string{"BOOKIT_JWT_SECRET_PREVIOUS": "old-short"},
+			wantErr:      []string{"BOOKIT_JWT_SECRET_PREVIOUS"},
+			wantNotInErr: []string{"old-short"},
+		},
+		{
 			name: "all errors are reported together",
 			env: map[string]string{
 				"BOOKIT_ENV":          "x",
@@ -96,10 +124,11 @@ func TestLoad(t *testing.T) {
 				"BOOKIT_LOG_LEVEL":    "loud",
 				"BOOKIT_DATABASE_URL": "",
 				"BOOKIT_DB_MAX_CONNS": "-1",
+				"BOOKIT_JWT_SECRET":   "",
 			},
 			wantErr: []string{
 				"BOOKIT_ENV", "BOOKIT_HTTP_ADDR", "BOOKIT_LOG_LEVEL",
-				"BOOKIT_DATABASE_URL", "BOOKIT_DB_MAX_CONNS",
+				"BOOKIT_DATABASE_URL", "BOOKIT_DB_MAX_CONNS", "BOOKIT_JWT_SECRET",
 			},
 		},
 	}
@@ -108,7 +137,10 @@ func TestLoad(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			env := map[string]string{"BOOKIT_DATABASE_URL": testDBURL}
+			env := map[string]string{
+				"BOOKIT_DATABASE_URL": testDBURL,
+				"BOOKIT_JWT_SECRET":   testJWTSecret,
+			}
 			maps.Copy(env, tt.env)
 
 			got, err := config.Load(func(key string) string { return env[key] })
@@ -142,14 +174,19 @@ func TestLoad(t *testing.T) {
 func TestConfig_LogValueHidesSecrets(t *testing.T) {
 	t.Parallel()
 
-	cfg := config.Config{Env: config.EnvDev, HTTPAddr: ":8080", DatabaseURL: testDBURL, DBMaxConns: 10}
+	cfg := config.Config{
+		Env: config.EnvDev, HTTPAddr: ":8080", DatabaseURL: testDBURL, DBMaxConns: 10,
+		JWTSecret: testJWTSecret, JWTPreviousSecret: testJWTOld,
+	}
 
 	var buf bytes.Buffer
 	slog.New(slog.NewJSONHandler(&buf, nil)).Info("config", "config", cfg)
 
 	out := buf.String()
-	if strings.Contains(out, testPassword) || strings.Contains(out, "postgres://") {
-		t.Errorf("log output leaks the database URL: %s", out)
+	for _, secret := range []string{testPassword, "postgres://", testJWTSecret, testJWTOld} {
+		if strings.Contains(out, secret) {
+			t.Errorf("log output leaks %q: %s", secret, out)
+		}
 	}
 	if !strings.Contains(out, `"db_max_conns":10`) {
 		t.Errorf("log output misses db_max_conns: %s", out)

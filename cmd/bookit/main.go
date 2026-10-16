@@ -1,48 +1,32 @@
-// Command bookit is the BookIt API server.
+// Command bookit is the BookIt API server and its admin tools.
+//
+// Usage:
+//
+//	bookit                                run the HTTP server
+//	bookit create-admin -email E -name N  create a super admin account
 package main
 
 import (
-	"context"
 	"fmt"
 	"log/slog"
 	"os"
-	"os/signal"
-	"syscall"
-
-	"github.com/Vadim-27/bookit-api/internal/platform/config"
-	"github.com/Vadim-27/bookit-api/internal/platform/httpserver"
-	"github.com/Vadim-27/bookit-api/internal/platform/logger"
-	"github.com/Vadim-27/bookit-api/internal/platform/postgres"
 )
 
 func main() {
-	if err := run(); err != nil {
-		slog.Error("bookit stopped", "error", err)
+	if err := run(os.Args[1:]); err != nil {
+		slog.Error("bookit failed", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
-	cfg, err := config.Load(os.Getenv)
-	if err != nil {
-		return fmt.Errorf("load config: %w", err)
+func run(args []string) error {
+	if len(args) == 0 {
+		return runServer()
 	}
-	log := logger.New(os.Stderr, cfg.Env == config.EnvProd, cfg.LogLevel)
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	pool, err := postgres.NewPool(ctx, cfg.DatabaseURL, cfg.DBMaxConns)
-	if err != nil {
-		return fmt.Errorf("connect to postgres: %w", err)
+	switch args[0] {
+	case "create-admin":
+		return runCreateAdmin(args[1:])
+	default:
+		return fmt.Errorf("unknown command %q (available: create-admin)", args[0])
 	}
-	// Deferred after the HTTP server stops: in-flight requests finish first.
-	defer pool.Close()
-
-	log.InfoContext(ctx, "starting bookit", "config", cfg)
-	if err := httpserver.Run(ctx, cfg.HTTPAddr, httpserver.New(log)); err != nil {
-		return fmt.Errorf("run http server: %w", err)
-	}
-	log.InfoContext(ctx, "bookit stopped")
-	return nil
 }
