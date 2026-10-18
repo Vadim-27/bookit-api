@@ -40,18 +40,24 @@ type Session struct {
 type Options struct {
 	// RefreshTTL is the lifetime of a refresh token; it must be positive.
 	RefreshTTL time.Duration
+	// MaxSessionAge is the absolute lifetime of a login session: after it the
+	// user must enter the password again, however active they are. It must be
+	// at least RefreshTTL.
+	MaxSessionAge time.Duration
 	// Now is the clock; nil means time.Now. Tests inject a fixed one.
 	Now func() time.Time
 }
 
 // Authenticator checks credentials and manages sessions.
 type Authenticator struct {
-	users      UserFinder
-	sessions   RefreshStore
-	tokens     *TokenManager
-	dummyHash  string
-	refreshTTL time.Duration
-	now        func() time.Time
+	users         UserFinder
+	sessions      RefreshStore
+	tokens        *TokenManager
+	dummyHash     string
+	refreshTTL    time.Duration
+	maxSessionAge time.Duration
+	throttle      *loginThrottle
+	now           func() time.Time
 }
 
 // NewAuthenticator returns an Authenticator. The first call in a process hashes
@@ -59,6 +65,9 @@ type Authenticator struct {
 func NewAuthenticator(users UserFinder, sessions RefreshStore, tokens *TokenManager, opts Options) (*Authenticator, error) {
 	if opts.RefreshTTL <= 0 {
 		return nil, errors.New("refresh token ttl must be positive")
+	}
+	if opts.MaxSessionAge < opts.RefreshTTL {
+		return nil, errors.New("max session age must be at least the refresh token ttl")
 	}
 	if opts.Now == nil {
 		opts.Now = time.Now
@@ -68,22 +77,33 @@ func NewAuthenticator(users UserFinder, sessions RefreshStore, tokens *TokenMana
 		return nil, fmt.Errorf("prepare login: %w", err)
 	}
 	return &Authenticator{
-		users:      users,
-		sessions:   sessions,
-		tokens:     tokens,
-		dummyHash:  hash,
-		refreshTTL: opts.RefreshTTL,
-		now:        opts.Now,
+		users:         users,
+		sessions:      sessions,
+		tokens:        tokens,
+		dummyHash:     hash,
+		refreshTTL:    opts.RefreshTTL,
+		maxSessionAge: opts.MaxSessionAge,
+		throttle:      newLoginThrottle(),
+		now:           opts.Now,
 	}, nil
 }
 
 // Login checks the credentials of a user account (platform or staff) and
 // starts a session. Every authentication failure returns ErrInvalidCredentials;
-// any other error is an infrastructure problem.
+// after repeated failures for one email it returns *TooManyAttemptsError until
+// the wait is over; any other error is an infrastructure problem.
 //
 // A bcrypt comparison is always performed, even for a malformed email or an
 // unknown account, so the response time does not reveal which emails exist.
 func (a *Authenticator) Login(ctx context.Context, email, password string) (*Session, error) {
+	key := throttleKey(email)
+	now := a.now()
+	// Checked before the password, so a guess sent too early costs nothing and
+	// tells nothing, not even whether it was right.
+	if wait := a.throttle.wait(key, now); wait > 0 {
+		return nil, &TooManyAttemptsError{RetryAfter: wait}
+	}
+
 	u, err := a.findUser(ctx, email)
 	switch {
 	case errors.Is(err, user.ErrNotFound):
@@ -106,15 +126,22 @@ func (a *Authenticator) Login(ctx context.Context, email, password string) (*Ses
 		len(password) <= maxPasswordBytes &&
 		u.Status == user.StatusActive
 	if !valid {
+		a.throttle.failure(key, now)
 		return nil, ErrInvalidCredentials
 	}
+	a.throttle.success(key)
 
 	refreshToken, refreshHash, err := newRefreshToken()
 	if err != nil {
 		return nil, err
 	}
-	now := a.now()
-	rt := &RefreshToken{UserID: u.ID, TokenHash: refreshHash, CreatedAt: now, ExpiresAt: now.Add(a.refreshTTL)}
+	rt := &RefreshToken{
+		UserID:           u.ID,
+		TokenHash:        refreshHash,
+		CreatedAt:        now,
+		ExpiresAt:        now.Add(a.refreshTTL),
+		SessionExpiresAt: now.Add(a.maxSessionAge),
+	}
 	if err := a.sessions.Insert(ctx, rt); err != nil {
 		return nil, fmt.Errorf("store refresh token: %w", err)
 	}
@@ -187,6 +214,27 @@ func (a *Authenticator) Logout(ctx context.Context, refreshToken string) error {
 		return fmt.Errorf("revoke session: %w", err)
 	}
 	return nil
+}
+
+// PurgeExpiredSessions deletes refresh tokens that expired more than a week
+// ago, in batches, and reports how many it deleted. It is meant to run
+// periodically; it stops early when ctx is cancelled.
+func (a *Authenticator) PurgeExpiredSessions(ctx context.Context) (int64, error) {
+	before := a.now().Add(-purgeDelay)
+	var total int64
+	for {
+		n, err := a.sessions.PurgeExpired(ctx, before, purgeBatch)
+		total += n
+		if err != nil {
+			return total, fmt.Errorf("purge expired refresh tokens: %w", err)
+		}
+		if n < purgeBatch {
+			return total, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+	}
 }
 
 // punishReuse revokes the whole session when an already exchanged token comes

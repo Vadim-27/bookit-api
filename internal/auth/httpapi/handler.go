@@ -7,7 +7,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/labstack/echo/v5"
@@ -120,7 +122,12 @@ func (h *Handler) login(c *echo.Context) error {
 	}
 
 	s, err := h.auth.Login(c.Request().Context(), req.Email, req.Password)
+	var tooMany *auth.TooManyAttemptsError
 	switch {
+	case errors.As(err, &tooMany):
+		c.Response().Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(tooMany.RetryAfter)))
+		return apierror.Write(c, http.StatusTooManyRequests, apierror.CodeTooManyRequests,
+			"too many failed attempts, try again later")
 	case errors.Is(err, auth.ErrInvalidCredentials):
 		// The same answer for every kind of failure: no hints for guessing.
 		return apierror.Write(c, http.StatusUnauthorized, apierror.CodeInvalidCredentials, "invalid credentials")
@@ -131,6 +138,12 @@ func (h *Handler) login(c *echo.Context) error {
 
 	h.setRefreshCookie(c, s)
 	return c.JSON(http.StatusOK, newTokenResponse(s))
+}
+
+// retryAfterSeconds rounds a wait up to whole seconds, at least one, as the
+// Retry-After header expects.
+func retryAfterSeconds(d time.Duration) int {
+	return max(1, int(math.Ceil(d.Seconds())))
 }
 
 func (h *Handler) refresh(c *echo.Context) error {

@@ -4,11 +4,22 @@ import (
 	"bytes"
 	"log/slog"
 	"maps"
+	"net"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/Vadim-27/bookit-api/internal/platform/config"
 )
+
+func mustCIDR(t *testing.T, s string) *net.IPNet {
+	t.Helper()
+	_, ipNet, err := net.ParseCIDR(s)
+	if err != nil {
+		t.Fatalf("ParseCIDR(%q): %v", s, err)
+	}
+	return ipNet
+}
 
 const (
 	testPassword  = "s3cretpw"
@@ -44,13 +55,25 @@ func TestLoad(t *testing.T) {
 				"BOOKIT_DB_MAX_CONNS":        "25",
 				"BOOKIT_JWT_SECRET_PREVIOUS": testJWTOld,
 				"BOOKIT_REQUIRE_HTTPS":       "true",
+				"BOOKIT_TRUSTED_PROXIES":     " 173.245.48.0/20 ,2400:cb00::/32,, ",
 			},
 			want: config.Config{
 				Env: config.EnvProd, HTTPAddr: "127.0.0.1:9000", LogLevel: slog.LevelDebug,
 				DatabaseURL: testDBURL, DBMaxConns: 25,
 				JWTSecret: testJWTSecret, JWTPreviousSecret: testJWTOld,
-				RequireHTTPS: true,
+				RequireHTTPS:   true,
+				TrustedProxies: []*net.IPNet{mustCIDR(t, "173.245.48.0/20"), mustCIDR(t, "2400:cb00::/32")},
 			},
+		},
+		{
+			name:    "trusted proxy that is not a range",
+			env:     map[string]string{"BOOKIT_TRUSTED_PROXIES": "10.0.0.0/8, cloudflare"},
+			wantErr: []string{"BOOKIT_TRUSTED_PROXIES", "cloudflare"},
+		},
+		{
+			name:    "trusted proxy as a bare address",
+			env:     map[string]string{"BOOKIT_TRUSTED_PROXIES": "10.0.0.1"},
+			wantErr: []string{"BOOKIT_TRUSTED_PROXIES"},
 		},
 		{
 			name:    "require https is not a boolean",
@@ -164,7 +187,7 @@ func TestLoad(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Load: unexpected error: %v", err)
 			}
-			if got != tt.want {
+			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("Load: got %+v, want %+v", got, tt.want)
 			}
 		})

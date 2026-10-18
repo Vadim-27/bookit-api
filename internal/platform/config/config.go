@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/url"
 	"strconv"
+	"strings"
 )
 
 const defaultDBMaxConns = 10
@@ -40,6 +41,11 @@ type Config struct {
 	// RequireHTTPS makes the server refuse plain HTTP requests and send HSTS.
 	// Turn it on in every deployed environment, dev included.
 	RequireHTTPS bool
+	// TrustedProxies are the address ranges of the proxies in front of the
+	// server (e.g. Cloudflare). Only requests from them may name the real
+	// client in X-Forwarded-For and the scheme in X-Forwarded-Proto. Empty
+	// means no proxy: the address of the connection is the client.
+	TrustedProxies []*net.IPNet
 }
 
 // LogValue implements slog.LogValuer, so logging a Config never leaks secrets.
@@ -50,6 +56,7 @@ func (c Config) LogValue() slog.Value {
 		slog.String("log_level", c.LogLevel.String()),
 		slog.Int("db_max_conns", int(c.DBMaxConns)),
 		slog.Bool("require_https", c.RequireHTTPS),
+		slog.Int("trusted_proxy_ranges", len(c.TrustedProxies)),
 	)
 }
 
@@ -93,6 +100,12 @@ func Load(getenv func(string) string) (Config, error) {
 	}
 	cfg.RequireHTTPS = requireHTTPS
 
+	proxies, err := parseTrustedProxies(getenv("BOOKIT_TRUSTED_PROXIES"))
+	if err != nil {
+		errs = append(errs, err)
+	}
+	cfg.TrustedProxies = proxies
+
 	if err := validateSecret("BOOKIT_JWT_SECRET", cfg.JWTSecret, true); err != nil {
 		errs = append(errs, err)
 	}
@@ -134,6 +147,24 @@ func validateSecret(name, value string, required bool) error {
 		return fmt.Errorf("%s: must be at least %d bytes", name, minSecretBytes)
 	}
 	return nil
+}
+
+// parseTrustedProxies parses a comma-separated list of CIDR ranges such as
+// "173.245.48.0/20, 2400:cb00::/32". An empty string means no proxy.
+func parseTrustedProxies(raw string) ([]*net.IPNet, error) {
+	var ranges []*net.IPNet
+	for part := range strings.SplitSeq(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		_, ipNet, err := net.ParseCIDR(part)
+		if err != nil {
+			return nil, fmt.Errorf("BOOKIT_TRUSTED_PROXIES: %q is not a CIDR range like 10.0.0.0/8", part)
+		}
+		ranges = append(ranges, ipNet)
+	}
+	return ranges, nil
 }
 
 func parseMaxConns(raw string) (int32, error) {

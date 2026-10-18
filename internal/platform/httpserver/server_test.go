@@ -192,8 +192,19 @@ func TestSecurityHeadersOnEveryAnswer(t *testing.T) {
 func TestRequireHTTPS(t *testing.T) {
 	t.Parallel()
 
-	forwarded := func(proto string) func(*http.Request) {
-		return func(r *http.Request) { r.Header.Set("X-Forwarded-Proto", proto) }
+	const (
+		publicPeer  = "203.0.113.7:4444" // anyone on the internet
+		privatePeer = "10.0.0.5:5555"    // our proxy in the private network
+		localPeer   = "127.0.0.1:6666"   // our proxy on the same host
+	)
+	// from sends the request from peer, with X-Forwarded-Proto values if given.
+	from := func(peer string, protos ...string) func(*http.Request) {
+		return func(r *http.Request) {
+			r.RemoteAddr = peer
+			for _, p := range protos {
+				r.Header.Add("X-Forwarded-Proto", p)
+			}
+		}
 	}
 	tests := []struct {
 		name       string
@@ -202,14 +213,22 @@ func TestRequireHTTPS(t *testing.T) {
 		wantStatus int
 		wantHSTS   bool
 	}{
-		{"plain http is refused", "/api/v1/anything", nil, http.StatusForbidden, false},
-		{"forwarded http is refused", "/api/v1/anything", forwarded("http"), http.StatusForbidden, false},
-		{"garbage in the header is refused", "/api/v1/anything", forwarded("httpss"), http.StatusForbidden, false},
-		{"forwarded https passes", "/health", forwarded("https"), http.StatusOK, true},
-		{"header is case-insensitive", "/health", forwarded("HTTPS"), http.StatusOK, true},
-		{"first value of a proxy chain counts", "/health", forwarded("https, http"), http.StatusOK, true},
-		{"direct tls passes", "/health", func(r *http.Request) { r.TLS = &tls.ConnectionState{} }, http.StatusOK, true},
-		{"health probes may use plain http", "/health", nil, http.StatusOK, false},
+		{"plain http is refused", "/api/v1/anything", from(publicPeer), http.StatusForbidden, false},
+		// The attack of finding F1: a client claims HTTPS over plain HTTP.
+		{"a forged header from the internet is ignored", "/api/v1/anything", from(publicPeer, "https"), http.StatusForbidden, false},
+		{"https from our proxy passes", "/health", from(privatePeer, "https"), http.StatusOK, true},
+		{"https from a proxy on the same host passes", "/health", from(localPeer, "https"), http.StatusOK, true},
+		{"http reported by our proxy is refused", "/api/v1/anything", from(privatePeer, "http"), http.StatusForbidden, false},
+		{"header is case-insensitive", "/health", from(privatePeer, "HTTPS"), http.StatusOK, true},
+		{"garbage in the header is refused", "/api/v1/anything", from(privatePeer, "httpss"), http.StatusForbidden, false},
+		// The proxy appends its value last; a value the client put first is ignored.
+		{"a client value before the proxy's is ignored", "/api/v1/anything", from(privatePeer, "https, http"), http.StatusForbidden, false},
+		{"the proxy's last value counts", "/health", from(privatePeer, "http, https"), http.StatusOK, true},
+		{"direct tls passes", "/health", func(r *http.Request) {
+			r.RemoteAddr = publicPeer
+			r.TLS = &tls.ConnectionState{}
+		}, http.StatusOK, true},
+		{"health probes may use plain http", "/health", from(publicPeer), http.StatusOK, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -230,6 +249,80 @@ func TestRequireHTTPS(t *testing.T) {
 				t.Errorf("HSTS sent: got %v, want %v", got, tt.wantHSTS)
 			}
 		})
+	}
+}
+
+// The client address decides the rate limits, so it must not be forgeable.
+func TestClientIP(t *testing.T) {
+	t.Parallel()
+
+	_, cloudflare, err := net.ParseCIDR("173.245.48.0/20")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const (
+		cfEdge   = "173.245.48.10:443" // a Cloudflare edge, trusted when configured
+		stranger = "203.0.113.7:4444"  // anyone on the internet
+		client   = "198.51.100.23"     // the real visitor
+	)
+	tests := []struct {
+		name    string
+		trusted []*net.IPNet
+		peer    string
+		xff     string
+		want    string
+	}{
+		{"no proxy configured: the header is ignored", nil, stranger, "1.2.3.4", "203.0.113.7"},
+		{"no proxy configured: even from a Cloudflare address", nil, cfEdge, client, "173.245.48.10"},
+		{"trusted proxy names the client", []*net.IPNet{cloudflare}, cfEdge, client, client},
+		{"untrusted peer cannot name a client", []*net.IPNet{cloudflare}, stranger, "1.2.3.4", "203.0.113.7"},
+		{"a value the client made up on the left is skipped", []*net.IPNet{cloudflare}, cfEdge, "6.6.6.6, " + client, client},
+		{"no header from a trusted proxy", []*net.IPNet{cloudflare}, cfEdge, "", "173.245.48.10"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			e := httpserver.New(discardLogger(), httpserver.Options{TrustedProxies: tt.trusted},
+				func(api *echo.Group) {
+					api.GET("/ip", func(c *echo.Context) error { return c.String(http.StatusOK, c.RealIP()) })
+				})
+			rec := serve(e, http.MethodGet, "/api/v1/ip", func(r *http.Request) {
+				r.RemoteAddr = tt.peer
+				if tt.xff != "" {
+					r.Header.Set("X-Forwarded-For", tt.xff)
+				}
+			})
+			if got := rec.Body.String(); got != tt.want {
+				t.Errorf("client IP: got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRequireHTTPS_TrustsConfiguredProxyForTheScheme(t *testing.T) {
+	t.Parallel()
+
+	_, cloudflare, err := net.ParseCIDR("173.245.48.0/20")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := httpserver.New(discardLogger(), httpserver.Options{RequireHTTPS: true, TrustedProxies: []*net.IPNet{cloudflare}})
+
+	fromCF := serve(e, http.MethodGet, "/health", func(r *http.Request) {
+		r.RemoteAddr = "173.245.48.10:443"
+		r.Header.Set("X-Forwarded-Proto", "https")
+	})
+	if fromCF.Header().Get("Strict-Transport-Security") == "" {
+		t.Error("https reported by a configured proxy was not believed")
+	}
+
+	forged := serve(e, http.MethodGet, "/api/v1/anything", func(r *http.Request) {
+		r.RemoteAddr = "203.0.113.7:4444"
+		r.Header.Set("X-Forwarded-Proto", "https")
+	})
+	if forged.Code != http.StatusForbidden {
+		t.Errorf("https claimed by a stranger: got %d, want %d", forged.Code, http.StatusForbidden)
 	}
 }
 

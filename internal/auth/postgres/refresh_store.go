@@ -16,7 +16,7 @@ import (
 
 // refreshColumns lists the columns in the order scanToken reads them. It is a
 // constant on purpose: request data must never be concatenated into SQL.
-const refreshColumns = `id, user_id, family_id, token_hash, created_at, expires_at, used_at, revoked_at`
+const refreshColumns = `id, user_id, family_id, token_hash, created_at, expires_at, session_expires_at, used_at, revoked_at`
 
 // RefreshStore keeps refresh tokens in PostgreSQL.
 type RefreshStore struct {
@@ -44,10 +44,10 @@ func insert(ctx context.Context, q queryRower, t *auth.RefreshToken) error {
 		family = &t.FamilyID
 	}
 	err := q.QueryRow(ctx,
-		`INSERT INTO refresh_tokens (user_id, family_id, token_hash, created_at, expires_at)
-		 VALUES ($1, COALESCE($2::uuid, gen_random_uuid()), $3, $4, $5)
+		`INSERT INTO refresh_tokens (user_id, family_id, token_hash, created_at, expires_at, session_expires_at)
+		 VALUES ($1, COALESCE($2::uuid, gen_random_uuid()), $3, $4, $5, $6)
 		 RETURNING id, family_id`,
-		t.UserID, family, t.TokenHash, t.CreatedAt, t.ExpiresAt,
+		t.UserID, family, t.TokenHash, t.CreatedAt, t.ExpiresAt, t.SessionExpiresAt,
 	).Scan(&t.ID, &t.FamilyID)
 	if err != nil {
 		return fmt.Errorf("insert refresh token: %w", err)
@@ -79,6 +79,12 @@ func (s *RefreshStore) Rotate(ctx context.Context, oldHash []byte, next *auth.Re
 	}
 
 	next.UserID, next.FamilyID = prev.UserID, prev.FamilyID
+	// A refresh never extends the session itself: the new token lives at most
+	// until the session ends (the database checks this too).
+	next.SessionExpiresAt = prev.SessionExpiresAt
+	if next.ExpiresAt.After(next.SessionExpiresAt) {
+		next.ExpiresAt = next.SessionExpiresAt
+	}
 	if err := insert(ctx, tx, next); err != nil {
 		return nil, err
 	}
@@ -112,10 +118,23 @@ func (s *RefreshStore) RevokeFamily(ctx context.Context, familyID string, now ti
 	return nil
 }
 
+// PurgeExpired deletes at most limit tokens that expired before before. The
+// limit keeps one statement short, so it never holds locks for long.
+func (s *RefreshStore) PurgeExpired(ctx context.Context, before time.Time, limit int) (int64, error) {
+	tag, err := s.pool.Exec(ctx,
+		`DELETE FROM refresh_tokens
+		 WHERE id IN (SELECT id FROM refresh_tokens WHERE expires_at < $1 LIMIT $2)`,
+		before, limit)
+	if err != nil {
+		return 0, fmt.Errorf("purge expired refresh tokens: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 func scanToken(row pgx.Row) (*auth.RefreshToken, error) {
 	var t auth.RefreshToken
 	err := row.Scan(&t.ID, &t.UserID, &t.FamilyID, &t.TokenHash,
-		&t.CreatedAt, &t.ExpiresAt, &t.UsedAt, &t.RevokedAt)
+		&t.CreatedAt, &t.ExpiresAt, &t.SessionExpiresAt, &t.UsedAt, &t.RevokedAt)
 	if err != nil {
 		return nil, err
 	}

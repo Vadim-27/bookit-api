@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
+	"strings"
 	"time"
 
 	"golang.org/x/term"
@@ -16,14 +19,16 @@ import (
 	userpg "github.com/Vadim-27/bookit-api/internal/user/postgres"
 )
 
-// adminPasswordEnv is the fallback for terminals that cannot hide the input
-// (for example Git Bash on Windows). Set it only for the one command.
-const adminPasswordEnv = "BOOKIT_ADMIN_PASSWORD"
+// maxStdinPassword bounds what is read from stdin. A valid password is at most
+// 72 bytes, so anything longer is rejected later by the password policy.
+const maxStdinPassword = 1 << 10
 
 func runCreateAdmin(args []string) error {
 	fs := flag.NewFlagSet("create-admin", flag.ContinueOnError)
 	email := fs.String("email", "", "email of the new super admin (required)")
 	name := fs.String("name", "", "full name of the new super admin (required)")
+	passwordStdin := fs.Bool("password-stdin", false,
+		"read the password from the first line of stdin (for terminals that cannot hide input)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -36,7 +41,7 @@ func runCreateAdmin(args []string) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	password, err := readPassword()
+	password, err := readPassword(*passwordStdin)
 	if err != nil {
 		return err
 	}
@@ -59,15 +64,20 @@ func runCreateAdmin(args []string) error {
 	return nil
 }
 
-// readPassword asks for the password twice with hidden input. When stdin is
-// not a terminal it falls back to the BOOKIT_ADMIN_PASSWORD variable.
-func readPassword() (string, error) {
+// readPassword returns the password of the new admin. With fromStdin it reads
+// the first line of stdin; otherwise it asks twice with hidden input.
+//
+// The password is never taken from a command-line argument or an environment
+// variable: arguments end up in the shell history and the process list, and the
+// environment is inherited by child processes.
+func readPassword(fromStdin bool) (string, error) {
+	if fromStdin {
+		return passwordFromReader(os.Stdin)
+	}
+
 	fd := int(os.Stdin.Fd())
 	if !term.IsTerminal(fd) {
-		if p := os.Getenv(adminPasswordEnv); p != "" {
-			return p, nil
-		}
-		return "", fmt.Errorf("stdin is not a terminal: set %s for this command", adminPasswordEnv)
+		return "", errors.New("stdin is not a terminal: pipe the password and add -password-stdin")
 	}
 
 	first, err := promptHidden(fd, "Password: ")
@@ -82,6 +92,20 @@ func readPassword() (string, error) {
 		return "", errors.New("passwords do not match")
 	}
 	return first, nil
+}
+
+// passwordFromReader returns the first line of r without its line ending.
+// Spaces are part of the password and are kept.
+func passwordFromReader(r io.Reader) (string, error) {
+	line, err := bufio.NewReader(io.LimitReader(r, maxStdinPassword)).ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", fmt.Errorf("read password from stdin: %w", err)
+	}
+	password := strings.TrimRight(line, "\r\n")
+	if password == "" {
+		return "", errors.New("no password on stdin")
+	}
+	return password, nil
 }
 
 func promptHidden(fd int, prompt string) (string, error) {

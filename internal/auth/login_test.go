@@ -18,6 +18,7 @@ import (
 const (
 	loginPassword = "correct-horse-battery"
 	refreshTTL    = 30 * 24 * time.Hour
+	maxSessionAge = 90 * 24 * time.Hour
 )
 
 // testClock is a clock the tests move by hand; it is safe for concurrent use.
@@ -88,6 +89,7 @@ type fakeSessions struct {
 	seq         int
 	insertErr   error
 	rotateCalls int
+	purgeCalls  int
 }
 
 func newFakeSessions() *fakeSessions {
@@ -126,6 +128,10 @@ func (f *fakeSessions) Rotate(_ context.Context, oldHash []byte, next *auth.Refr
 	used := now
 	old.UsedAt = &used
 	next.UserID, next.FamilyID = old.UserID, old.FamilyID
+	next.SessionExpiresAt = old.SessionExpiresAt
+	if next.ExpiresAt.After(next.SessionExpiresAt) {
+		next.ExpiresAt = next.SessionExpiresAt
+	}
 	if err := f.insertLocked(next); err != nil {
 		return nil, err
 	}
@@ -142,6 +148,30 @@ func (f *fakeSessions) Find(_ context.Context, hash []byte) (*auth.RefreshToken,
 	}
 	cp := *t
 	return &cp, nil
+}
+
+func (f *fakeSessions) PurgeExpired(_ context.Context, before time.Time, limit int) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.purgeCalls++
+	var n int64
+	for hash, t := range f.byHash {
+		if int(n) == limit {
+			break
+		}
+		if t.ExpiresAt.Before(before) {
+			delete(f.byHash, hash)
+			n++
+		}
+	}
+	return n, nil
+}
+
+// put stores a token directly, for tests that need many records.
+func (f *fakeSessions) put(t auth.RefreshToken) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.byHash[string(t.TokenHash)] = &t
 }
 
 func (f *fakeSessions) RevokeFamily(_ context.Context, familyID string, now time.Time) error {
@@ -185,7 +215,8 @@ func newEnv(t *testing.T, users map[string]*user.User) *env {
 	if err != nil {
 		t.Fatalf("NewTokenManager: %v", err)
 	}
-	a, err := auth.NewAuthenticator(finder, sessions, tokens, auth.Options{RefreshTTL: refreshTTL, Now: clock.Now})
+	a, err := auth.NewAuthenticator(finder, sessions, tokens,
+		auth.Options{RefreshTTL: refreshTTL, MaxSessionAge: maxSessionAge, Now: clock.Now})
 	if err != nil {
 		t.Fatalf("NewAuthenticator: %v", err)
 	}
@@ -383,9 +414,18 @@ func TestNewAuthenticator_RejectsBadOptions(t *testing.T) {
 	t.Parallel()
 
 	tokens := newManager(t, secretA, "", epoch)
-	for _, ttl := range []time.Duration{0, -time.Hour} {
-		if _, err := auth.NewAuthenticator(&fakeFinder{}, newFakeSessions(), tokens, auth.Options{RefreshTTL: ttl}); err == nil {
-			t.Errorf("RefreshTTL %v: got nil error, want an error", ttl)
+	tests := []struct {
+		name string
+		opts auth.Options
+	}{
+		{"zero refresh ttl", auth.Options{RefreshTTL: 0, MaxSessionAge: maxSessionAge}},
+		{"negative refresh ttl", auth.Options{RefreshTTL: -time.Hour, MaxSessionAge: maxSessionAge}},
+		{"session shorter than a token", auth.Options{RefreshTTL: refreshTTL, MaxSessionAge: refreshTTL - time.Hour}},
+		{"no session limit", auth.Options{RefreshTTL: refreshTTL}},
+	}
+	for _, tt := range tests {
+		if _, err := auth.NewAuthenticator(&fakeFinder{}, newFakeSessions(), tokens, tt.opts); err == nil {
+			t.Errorf("%s: got nil error, want an error", tt.name)
 		}
 	}
 }

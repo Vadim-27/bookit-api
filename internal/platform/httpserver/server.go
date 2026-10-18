@@ -4,8 +4,8 @@ package httpserver
 import (
 	"context"
 	"log/slog"
+	"net"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/labstack/echo/v5"
@@ -19,6 +19,9 @@ type Options struct {
 	// RequireHTTPS makes the server refuse requests that did not arrive over
 	// HTTPS and send the HSTS header. Turn it on in every deployed environment.
 	RequireHTTPS bool
+	// TrustedProxies are the address ranges of the proxies in front of the
+	// server (e.g. Cloudflare). Empty means no proxy.
+	TrustedProxies []*net.IPNet
 }
 
 // RouteRegistrar mounts the routes of one feature on the /api/v1 group.
@@ -30,12 +33,12 @@ type RouteRegistrar func(api *echo.Group)
 // routes registered. Echo's own messages (startup, shutdown, handler errors)
 // go through log.
 func New(log *slog.Logger, opts Options, routes ...RouteRegistrar) *echo.Echo {
+	ipExtractor, schemeExtractor := extractors(opts.TrustedProxies)
 	e := echo.NewWithConfig(echo.Config{
 		Logger:           log,
 		HTTPErrorHandler: apierror.Handler,
-		// The client address is the address of the connection. X-Forwarded-For
-		// can be forged by anyone, so it is not trusted (rate limits depend on it).
-		IPExtractor: echo.ExtractIPDirect(),
+		IPExtractor:      ipExtractor,
+		SchemeExtractor:  schemeExtractor,
 		// By default a group with middleware catches every unknown path under its
 		// prefix, so an unknown URL would run, say, the auth middleware and answer
 		// 401 instead of 404. Middleware is attached to real routes only.
@@ -55,6 +58,26 @@ func New(log *slog.Logger, opts Options, routes ...RouteRegistrar) *echo.Echo {
 	return e
 }
 
+// extractors decide who the client is and whether the request is HTTPS.
+// Forwarding headers can be forged by anyone, so they are believed only when
+// the connection comes from a proxy we trust: our own proxy on a loopback or
+// private address, plus the configured ranges (e.g. Cloudflare).
+//
+// Without configured ranges the client is the address of the connection and
+// X-Forwarded-For is ignored. With them the client is the rightmost address in
+// X-Forwarded-For that is not a trusted proxy: values further left may have
+// been made up by the client itself. Rate limits depend on this.
+func extractors(trusted []*net.IPNet) (echo.IPExtractor, echo.SchemeExtractor) {
+	opts := make([]echo.TrustOption, 0, len(trusted))
+	for _, r := range trusted {
+		opts = append(opts, echo.TrustIPRange(r))
+	}
+	if len(trusted) == 0 {
+		return echo.ExtractIPDirect(), echo.ExtractSchemeFromHeaders()
+	}
+	return echo.ExtractIPFromXFFHeader(opts...), echo.ExtractSchemeFromHeaders(opts...)
+}
+
 func health(c *echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -72,7 +95,7 @@ func securityHeaders(requireHTTPS bool) echo.MiddlewareFunc {
 
 			if requireHTTPS {
 				switch {
-				case isHTTPS(c.Request()):
+				case isHTTPS(c):
 					h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 				case c.Request().URL.Path != "/health":
 					return apierror.Write(c, http.StatusForbidden, apierror.CodeHTTPSRequired, "https is required")
@@ -84,15 +107,11 @@ func securityHeaders(requireHTTPS bool) echo.MiddlewareFunc {
 }
 
 // isHTTPS reports whether the request arrived over TLS, either directly or
-// through a TLS-terminating proxy that says so in X-Forwarded-Proto. The
-// proxy header is only meaningful when the server is reachable through the
-// proxy alone; a client talking to the server directly can only deceive itself.
-func isHTTPS(r *http.Request) bool {
-	if r.TLS != nil {
-		return true
-	}
-	proto, _, _ := strings.Cut(r.Header.Get("X-Forwarded-Proto"), ",")
-	return strings.EqualFold(strings.TrimSpace(proto), "https")
+// through a trusted TLS-terminating proxy (see SchemeExtractor in New).
+// "wss" is the same connection security for WebSocket requests.
+func isHTTPS(c *echo.Context) bool {
+	scheme := c.Scheme()
+	return scheme == "https" || scheme == "wss"
 }
 
 // Run serves h on addr until ctx is cancelled, then shuts the server down

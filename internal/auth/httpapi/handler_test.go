@@ -237,6 +237,28 @@ func TestLogin_WrongCredentialsAreAnsweredGenerically(t *testing.T) {
 	}
 }
 
+func TestLogin_TooManyAttemptsAnswers429WithRetryAfter(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeAuth{err: &auth.TooManyAttemptsError{RetryAfter: 1500 * time.Millisecond}}
+	var logs bytes.Buffer
+	rec := do(newServer(fake, httpapi.Options{}, noLimits(), &logs), http.MethodPost, loginPath,
+		`{"email":"x@example.com","password":"guess-number-9"}`, nil)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status: got %d, want %d", rec.Code, http.StatusTooManyRequests)
+	}
+	if got := errorOf(t, rec); got.Code != apierror.CodeTooManyRequests {
+		t.Errorf("code: got %q, want %q", got.Code, apierror.CodeTooManyRequests)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "2" {
+		t.Errorf("Retry-After: got %q, want 2 (1.5s rounded up)", got)
+	}
+	if refreshCookie(rec) != nil {
+		t.Error("a throttled login must not set a cookie")
+	}
+}
+
 func TestLogin_ServiceFailureIsAGenericServerError(t *testing.T) {
 	t.Parallel()
 

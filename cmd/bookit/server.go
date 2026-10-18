@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/Vadim-27/bookit-api/internal/platform/config"
 	"github.com/Vadim-27/bookit-api/internal/platform/httpserver"
 	"github.com/Vadim-27/bookit-api/internal/platform/logger"
+	"github.com/Vadim-27/bookit-api/internal/platform/periodic"
 	"github.com/Vadim-27/bookit-api/internal/platform/postgres"
 	"github.com/Vadim-27/bookit-api/internal/platform/ratelimit"
 	userpg "github.com/Vadim-27/bookit-api/internal/user/postgres"
@@ -27,6 +29,11 @@ const (
 	// refreshTokenTTL is how long a session lasts without the user logging in
 	// again; every refresh starts the period anew.
 	refreshTokenTTL = 30 * 24 * time.Hour
+	// maxSessionAge is the absolute limit: after it the password is required
+	// again, however active the user is.
+	maxSessionAge = 90 * 24 * time.Hour
+	// sessionPurgeInterval is how often expired refresh tokens are deleted.
+	sessionPurgeInterval = 24 * time.Hour
 
 	// Login attempts per client IP: a burst of 5, then one every 12 seconds.
 	loginAttemptsPerMinute = 5
@@ -60,11 +67,27 @@ func runServer() error {
 	}
 	authenticator, err := auth.NewAuthenticator(
 		userpg.NewRepository(pool), authpg.NewRefreshStore(pool), tokens,
-		auth.Options{RefreshTTL: refreshTokenTTL},
+		auth.Options{RefreshTTL: refreshTokenTTL, MaxSessionAge: maxSessionAge},
 	)
 	if err != nil {
 		return fmt.Errorf("create authenticator: %w", err)
 	}
+
+	// Background jobs. Defers run in reverse order: on the way out the jobs are
+	// cancelled first, then awaited, and only then is the pool closed above.
+	jobsCtx, cancelJobs := context.WithCancel(ctx)
+	var jobs sync.WaitGroup
+	defer jobs.Wait()
+	defer cancelJobs()
+	jobs.Go(func() {
+		periodic.Run(jobsCtx, log, "purge expired sessions", sessionPurgeInterval, func(ctx context.Context) error {
+			n, err := authenticator.PurgeExpiredSessions(ctx)
+			if n > 0 {
+				log.InfoContext(ctx, "expired sessions purged", "count", n)
+			}
+			return err
+		})
+	})
 	authHandler := authhttp.New(authenticator, authhttp.Options{SecureCookies: cfg.RequireHTTPS})
 	// Each endpoint has its own limiter, so they do not eat each other's allowance.
 	limits := authhttp.Limits{
@@ -73,7 +96,7 @@ func runServer() error {
 		Logout:  ratelimit.PerMinute(sessionRequestsPerMinute, sessionBurst),
 	}
 
-	srv := httpserver.New(log, httpserver.Options{RequireHTTPS: cfg.RequireHTTPS},
+	srv := httpserver.New(log, httpserver.Options{RequireHTTPS: cfg.RequireHTTPS, TrustedProxies: cfg.TrustedProxies},
 		func(api *echo.Group) { authHandler.Register(api, limits) },
 	)
 

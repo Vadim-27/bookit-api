@@ -20,6 +20,15 @@ const refreshTokenLen = 43
 // harmless double submit (two browser tabs refreshing at once) rather than theft.
 const reuseGrace = 10 * time.Second
 
+const (
+	// purgeDelay keeps expired tokens for a week before deleting them: a
+	// replayed token that was used but not yet expired is still recognised as
+	// theft, and recent sessions stay available for investigation.
+	purgeDelay = 7 * 24 * time.Hour
+	// purgeBatch bounds one DELETE, so the clean-up never holds locks for long.
+	purgeBatch = 1000
+)
+
 // Errors of the refresh token storage.
 var (
 	// ErrRefreshNotUsable means the token is unknown, already used, revoked or expired.
@@ -37,6 +46,9 @@ type RefreshToken struct {
 	TokenHash []byte
 	CreatedAt time.Time
 	ExpiresAt time.Time
+	// SessionExpiresAt is when the whole login session ends, however often it
+	// is refreshed; ExpiresAt never exceeds it.
+	SessionExpiresAt time.Time
 	// UsedAt is set when the token was exchanged for a new one.
 	UsedAt *time.Time
 	// RevokedAt is set when the whole family was revoked.
@@ -50,8 +62,10 @@ type RefreshStore interface {
 	Insert(ctx context.Context, t *RefreshToken) error
 
 	// Rotate atomically marks the token with oldHash as used and stores next in
-	// the same family. Of two concurrent calls with the same hash exactly one
-	// succeeds. It returns the old token, or ErrRefreshNotUsable.
+	// the same family. next inherits UserID, FamilyID and SessionExpiresAt from
+	// the old token, and its ExpiresAt is cut to SessionExpiresAt. Of two
+	// concurrent calls with the same hash exactly one succeeds. It returns the
+	// old token, or ErrRefreshNotUsable.
 	Rotate(ctx context.Context, oldHash []byte, next *RefreshToken, now time.Time) (*RefreshToken, error)
 
 	// Find returns the token with the given hash or ErrRefreshNotFound.
@@ -59,6 +73,10 @@ type RefreshStore interface {
 
 	// RevokeFamily revokes every token of the family. It is idempotent.
 	RevokeFamily(ctx context.Context, familyID string, now time.Time) error
+
+	// PurgeExpired deletes at most limit tokens that expired before before and
+	// reports how many it deleted.
+	PurgeExpired(ctx context.Context, before time.Time, limit int) (int64, error)
 }
 
 // newRefreshToken returns a fresh random token and its hash.

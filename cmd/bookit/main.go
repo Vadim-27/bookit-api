@@ -3,7 +3,8 @@
 // Usage:
 //
 //	bookit                                run the HTTP server
-//	bookit create-admin -email E -name N  create a super admin account
+//	bookit create-admin -email E -name N [-password-stdin]
+//	                                      create a super admin account
 package main
 
 import (

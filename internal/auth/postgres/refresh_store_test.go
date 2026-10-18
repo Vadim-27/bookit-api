@@ -69,11 +69,21 @@ func newUser(t *testing.T, users *userpg.Repository) string {
 func token(userID, seed string, expiresIn time.Duration) *auth.RefreshToken {
 	sum := sha256.Sum256([]byte(seed + "-" + unique()))
 	return &auth.RefreshToken{
-		UserID:    userID,
-		TokenHash: sum[:],
-		CreatedAt: now,
-		ExpiresAt: now.Add(expiresIn),
+		UserID:           userID,
+		TokenHash:        sum[:],
+		CreatedAt:        now,
+		ExpiresAt:        now.Add(expiresIn),
+		SessionExpiresAt: now.Add(max(expiresIn, 90*24*time.Hour)),
 	}
+}
+
+// expiredAgo builds a token that expired ago before now.
+func expiredAgo(userID, seed string, ago time.Duration) *auth.RefreshToken {
+	t := token(userID, seed, time.Hour)
+	t.ExpiresAt = now.Add(-ago)
+	t.CreatedAt = t.ExpiresAt.Add(-30 * 24 * time.Hour)
+	t.SessionExpiresAt = t.ExpiresAt
+	return t
 }
 
 func TestRefreshStore_InsertAndFind(t *testing.T) {
@@ -129,6 +139,13 @@ func TestRefreshStore_InsertRejectsBadData(t *testing.T) {
 	t.Run("unknown user", func(t *testing.T) {
 		if err := store.Insert(ctx, token("00000000-0000-0000-0000-000000000000", "orphan", time.Hour)); err == nil {
 			t.Error("Insert: got nil error, want a foreign key error")
+		}
+	})
+	t.Run("token outliving its session", func(t *testing.T) {
+		bad := token(userID, "outlives", time.Hour)
+		bad.SessionExpiresAt = now.Add(time.Minute)
+		if err := store.Insert(ctx, bad); err == nil {
+			t.Error("Insert: got nil error, want a constraint error")
 		}
 	})
 	t.Run("duplicate hash", func(t *testing.T) {
@@ -260,6 +277,80 @@ func TestRefreshStore_RotateConcurrentlySucceedsOnce(t *testing.T) {
 	}
 	if stored != 1 {
 		t.Errorf("%d new tokens were stored, want exactly 1", stored)
+	}
+}
+
+func TestRefreshStore_RotateNeverExtendsTheSession(t *testing.T) {
+	t.Parallel()
+	store, users := newStore(t)
+	ctx := context.Background()
+
+	first := token(newUser(t, users), "near-end", time.Hour)
+	first.SessionExpiresAt = now.Add(2 * time.Hour) // the session ends soon
+	if err := store.Insert(ctx, first); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+
+	next := token("", "would-live-30-days", 30*24*time.Hour)
+	next.SessionExpiresAt = time.Time{} // must be inherited, not trusted from the caller
+	if _, err := store.Rotate(ctx, first.TokenHash, next, now.Add(time.Minute)); err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+
+	sessionEnd := now.Add(2 * time.Hour)
+	if !next.SessionExpiresAt.Equal(sessionEnd) || !next.ExpiresAt.Equal(sessionEnd) {
+		t.Errorf("the new token must end with the session (%v): expires %v, session %v",
+			sessionEnd, next.ExpiresAt, next.SessionExpiresAt)
+	}
+	stored, err := store.Find(ctx, next.TokenHash)
+	if err != nil || !stored.ExpiresAt.Equal(sessionEnd) || !stored.SessionExpiresAt.Equal(sessionEnd) {
+		t.Errorf("stored token: %+v (err %v), want both expiries %v", stored, err, sessionEnd)
+	}
+}
+
+func TestRefreshStore_PurgeExpired(t *testing.T) {
+	t.Parallel()
+	store, users := newStore(t)
+	ctx := context.Background()
+	userID := newUser(t, users)
+
+	old := []*auth.RefreshToken{
+		expiredAgo(userID, "old-1", 10*24*time.Hour),
+		expiredAgo(userID, "old-2", 9*24*time.Hour),
+		expiredAgo(userID, "old-3", 8*24*time.Hour),
+	}
+	recent := expiredAgo(userID, "recent", 24*time.Hour)
+	live := token(userID, "live", time.Hour)
+	for _, tok := range append(old, recent, live) {
+		if err := store.Insert(ctx, tok); err != nil {
+			t.Fatalf("Insert: %v", err)
+		}
+	}
+
+	before := now.Add(-7 * 24 * time.Hour)
+
+	// The limit bounds one call.
+	n, err := store.PurgeExpired(ctx, before, 2)
+	if err != nil {
+		t.Fatalf("PurgeExpired: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("deleted with limit 2: got %d", n)
+	}
+
+	// The next call takes the rest.
+	if _, err := store.PurgeExpired(ctx, before, 1000); err != nil {
+		t.Fatalf("PurgeExpired: %v", err)
+	}
+	for _, tok := range old {
+		if _, err := store.Find(ctx, tok.TokenHash); !errors.Is(err, auth.ErrRefreshNotFound) {
+			t.Errorf("a token expired over a week ago survived: %v", err)
+		}
+	}
+	for name, tok := range map[string]*auth.RefreshToken{"recently expired": recent, "live": live} {
+		if _, err := store.Find(ctx, tok.TokenHash); err != nil {
+			t.Errorf("the %s token was deleted: %v", name, err)
+		}
 	}
 }
 
