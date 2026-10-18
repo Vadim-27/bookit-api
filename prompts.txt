@@ -1,0 +1,166 @@
+# Prompt log — Lesson 9 (BookIt API)
+
+The prompts used with the AI assistant for Part 2 (tasks 2.1 and 2.2) and the
+review instruction of task 3.1. BookIt is a booking platform; LibraTrack roles
+of the assignment map to BookIt as: reader ~ client, librarian ~ staff,
+admin ~ owner / super admin.
+
+
+==============================================================================
+## Task 2.1 — Authentication module (bcrypt + JWT)
+==============================================================================
+
+You are a senior Go developer and a security engineer. Write idiomatic Go 1.27
+following Effective Go and the Go Code Review Comments.
+
+## Output
+Separate files, each in its own code block with the path above it:
+- migrations/000002_create_users.up.sql / .down.sql
+- internal/user/user.go                  (domain: User, Status, errors)
+- internal/user/postgres/repository.go   (pgx repository)
+- internal/auth/password.go              (password policy and hashing)
+- internal/auth/token.go                 (JWT issue/parse)
+- internal/auth/login.go                 (login service)
+- internal/auth/httpapi/handler.go       (Echo handler POST /api/v1/auth/login)
+- table-driven tests next to each file
+No code outside these files.
+
+## Context
+- Stack: Go 1.27, Echo v5, PostgreSQL 17 through pgx v5 (pgxpool), golang-migrate.
+- Layers are separate packages that do not know each other: domain, service
+  (defines the interfaces it needs), repository (implements them implicitly),
+  HTTP handlers (call the service through an interface). Only cmd/bookit wires them.
+- Configuration comes from environment variables parsed once into a typed struct.
+- Staff accounts do not register themselves: the first super admin is created
+  with a CLI command `bookit create-admin`, later accounts come by invitation,
+  clients register inside a workspace (later step). So this task builds the
+  account storage, password hashing and LOGIN; there is no public Register
+  endpoint for staff.
+
+## Requirements
+Migration:
+- users(id uuid default gen_random_uuid(), email citext UNIQUE, password_hash
+  text NULL only while an invite is pending, full_name, status, is_super_admin
+  boolean, created_at, updated_at timestamptz).
+- Named constraints; CHECK for status ('active','pending_invite','suspended'),
+  length limits, and "active user must have a password".
+- The down migration drops everything the up created.
+
+Passwords:
+- Hash with bcrypt.GenerateFromPassword using bcrypt.DefaultCost (10).
+- Policy: at least 10 characters, at most 72 BYTES (bcrypt ignores the rest,
+  so longer passwords are rejected, not truncated).
+- Verify with bcrypt.CompareHashAndPassword.
+- PasswordHash has the struct tag json:"-" and never appears in a response or a log.
+
+Login:
+- The same answer for every failure: HTTP 401 {"error":{"code":"invalid_credentials",
+  "message":"invalid credentials"}} — unknown email, wrong password, suspended or
+  invited account, malformed email. This prevents user enumeration.
+- For an unknown or malformed email still run a bcrypt comparison against a dummy
+  hash, so the response time does not reveal which emails exist.
+- A storage failure is NOT reported as invalid credentials: it is a 500 with a
+  generic message; details go to the server log only.
+
+JWT:
+- Sign with jwt.SigningMethodHS256 (github.com/golang-jwt/jwt/v5). The parser
+  accepts ONLY HS256 (reject "alg": "none" and every other algorithm).
+- Claims: sub (user id), typ ("user" or "client"), ws (workspace, clients only),
+  iat, exp, jti. No role in the token: permissions are read from the database on
+  every request so a revocation works at once.
+- exp is mandatory; the access token lives 15 minutes (longer sessions use a
+  refresh token, separate task).
+- The signing secret comes only from the environment variable BOOKIT_JWT_SECRET,
+  at least 32 bytes; BOOKIT_JWT_SECRET_PREVIOUS is still accepted for verification
+  so the secret can be rotated. Secrets never appear in logs or error messages.
+
+HTTP:
+- POST /api/v1/auth/login with {"email","password"}; decode into a dedicated DTO,
+  reject unknown fields, limit the body size, require Content-Type: application/json.
+- Answer {"access_token","token_type":"Bearer","expires_at"} with Cache-Control: no-store.
+- Rate limit the login per client IP (5 per minute), answer 429 over the limit.
+
+SQL:
+- Only parameterized queries ($1, $2 ...); never concatenate request data.
+- Map the unique violation of users_email_key to a domain error ErrEmailTaken.
+
+Tests:
+- Table-driven, standard library only, run with -race.
+- Cover: success, every failure answers the same, malformed email never reaches
+  the database, storage failure is not hidden, alg none / other algorithm /
+  wrong secret / expired / tampered token are rejected, secret rotation.
+
+## Self-check
+At the end confirm: every up has a down; no SQL concatenates input; the hash and
+the secrets never reach a response or a log; all login failures look the same,
+also in time; the parser accepts HS256 only and requires exp.
+
+
+==============================================================================
+## Task 2.2 — Middleware chain (AuthMiddleware and RequireRole)
+==============================================================================
+
+You are a senior Go developer and a security engineer. Continue the same
+project (Go 1.27, Echo v5, layered packages as above).
+
+## Output
+- internal/auth/permission.go      (permission catalog, Principal, context helpers)
+- internal/auth/access.go          (Authenticate: token -> Principal)
+- internal/auth/httpapi/middleware.go (RequireAuth, RequirePermission)
+- GET /api/v1/me in internal/auth/httpapi/handler.go
+- route registration example and table-driven tests (httptest)
+
+## Requirements
+Authentication middleware (RequireAuth — the AuthMiddleware of the assignment):
+- Take the token ONLY from the header "Authorization: Bearer <token>" (scheme
+  case-insensitive), never from the URL or a cookie; limit the header size.
+- Validate the signature and exp through the token manager from task 2.1.
+- Load the user from the database on every request; a missing, suspended or
+  invited user is rejected. A client token never opens staff endpoints.
+- Store the caller (Principal: id, email, name, permissions) in the request
+  context — not in global state and not in echo.Context fields read by services.
+- On any failure answer 401 {"error":{"code":"unauthenticated",...}} with the
+  header WWW-Authenticate: Bearer, and stop the chain (do not call next).
+
+Authorization middleware (RequirePermission — the RequireRole of the assignment):
+- Checks a permission key instead of a role name (roles are sets of permissions
+  stored in the database; first iteration: a super admin holds every platform
+  permission, other users none).
+- No principal in the context -> 401 (fail closed: a route that forgot
+  RequireAuth must never open). Principal without the permission -> 403
+  {"error":{"code":"forbidden","message":"insufficient permissions"}}.
+
+Routing:
+- Show nested Echo route groups: public (/auth/login, /auth/refresh, /auth/logout),
+  protected (RequireAuth: /me), platform (RequireAuth, then RequirePermission per
+  route). Authentication always runs BEFORE authorization.
+- A group with middleware must not catch unknown paths: an unknown URL is 404,
+  not 401 (set echo.Config NoGroupAutoRegister404Routes).
+
+GET /me:
+- Returns id, email, full_name, is_super_admin and permissions (an empty list is
+  [] not null). Never the password hash or internal fields.
+
+Tests (table-driven, httptest):
+- No token -> 401; forged token -> 401; ordinary user on a platform route -> 403;
+  super admin -> 200; unknown path -> 404; token in query string or cookie is
+  ignored; RequirePermission without RequireAuth -> 401; a service failure is a
+  500 without details and the token is not logged.
+
+## Self-check
+Confirm: Auth runs before RBAC; every failure stops the chain; 401 vs 403 are
+used correctly; no token is read from the URL; nothing sensitive is logged.
+
+
+==============================================================================
+## Task 3.1 — AI-assisted security review (instruction given to the agent)
+==============================================================================
+
+Review this Go/Echo API code for security vulnerabilities. Check specifically
+for: 1) SQL injection (raw queries, string concatenation); 2) Mass assignment
+(binding request JSON directly to DB models); 3) Missing authentication or RBAC
+checks; 4) Sensitive data exposure (leaking password hashes or tokens in JSON
+responses or logs). Also check trust in proxy headers and rate limiting. Output a
+structured list with file and line numbers, severity (Low/Medium/High), and
+proposed fixes. Do not rewrite files completely.
+(The findings and their triage are in security_audit.md.)
